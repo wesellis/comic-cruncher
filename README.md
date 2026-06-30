@@ -4,8 +4,8 @@ A Python tool for compressing comic files and creating Trade Paperback collectio
 
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
-[![Stars](https://img.shields.io/github/stars/wesellis/APP-Comic-Cruncher-PDF-CBZ-CBR-Compression-TPB-Creator?style=flat-square)](https://github.com/wesellis/APP-Comic-Cruncher-PDF-CBZ-CBR-Compression-TPB-Creator/stargazers)
-[![Last Commit](https://img.shields.io/github/last-commit/wesellis/APP-Comic-Cruncher-PDF-CBZ-CBR-Compression-TPB-Creator?style=flat-square)](https://github.com/wesellis/APP-Comic-Cruncher-PDF-CBZ-CBR-Compression-TPB-Creator/commits)
+[![Stars](https://img.shields.io/github/stars/wesellis/comic-cruncher?style=flat-square)](https://github.com/wesellis/comic-cruncher/stargazers)
+[![Last Commit](https://img.shields.io/github/last-commit/wesellis/comic-cruncher?style=flat-square)](https://github.com/wesellis/comic-cruncher/commits)
 
 ## Screenshots
 
@@ -125,66 +125,3 @@ MIT License - See [LICENSE](LICENSE) for details.
 - [Pillow](https://python-pillow.org/) - Image processing
 - [pdf2image](https://github.com/Belval/pdf2image) - PDF conversion
 - [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) - GUI framework
-
----
-
-## Project Status & Roadmap
-
-**Completion: ~85%**
-
-### What Works
-- ✅ PyQt6 GUI with modern interface
-- ✅ Comic compression (PDF, CBZ, CBR to optimized CBZ)
-- ✅ WebP conversion with adjustable quality
-- ✅ Batch processing with multiprocessing
-- ✅ TPB Creator (auto-combines 12 issues per volume)
-- ✅ Auto-detection of comic series patterns
-- ✅ Smart file skipping (already processed files)
-- ✅ Backup creation before modifications
-- ✅ Real-time progress tracking
-- ✅ Cross-platform support (Windows, Linux, macOS)
-
-### Known Limitations & Missing Features
-
-**Format Support:**
-- ⚠️ **CB7 Format**: Mentioned in README but implementation incomplete
-- ⚠️ **CBT Format**: Not supported (TAR-based comics)
-- ⚠️ **Comic Metadata**: No preservation of ComicInfo.xml or metadata
-
-**Features:**
-- ⚠️ **GPU Acceleration**: OpenCV dependency present but may not be actively used
-- ⚠️ **CLI Mode**: No command-line interface for automation/scripting
-- ⚠️ **Undo Functionality**: No way to reverse compression or restore originals
-- ⚠️ **Custom Naming**: TPB naming is automatic, no custom templates
-- ⚠️ **Drag & Drop**: QDragEnterEvent imported but functionality not verified
-
-**Code Quality:**
-- ⚠️ **Testing**: No test suite or unit tests
-- ⚠️ **Error Recovery**: Basic error handling, could be more robust
-- ⚠️ **Logging**: No detailed log file output for troubleshooting
-- ⚠️ **Configuration File**: Settings not persisted between sessions
-
-### What Needs Work
-
-1. **CB7 Support** - Complete 7-Zip format handling
-2. **Metadata Preservation** - Keep ComicInfo.xml when compressing
-3. **Command Line Interface** - Add CLI for batch scripting
-4. **Settings Persistence** - Save user preferences to config file
-5. **Comprehensive Testing** - Add unit tests and integration tests
-6. **Better Error Handling** - More detailed error messages and recovery
-7. **Undo System** - Ability to restore from backups
-8. **Custom TPB Naming** - Templates for volume naming conventions
-9. **Logging System** - Detailed logs for debugging issues
-10. **Documentation** - More examples and troubleshooting guides
-
-### Contributing
-
-If you'd like to help complete any of the missing features above, contributions are welcome. Priority areas:
-1. Adding CB7 format support
-2. Implementing metadata preservation (ComicInfo.xml)
-3. Writing tests (pytest)
-4. Adding CLI interface for automation
-
----
-
-**Note:** Core functionality is solid and stable for PDF/CBZ/CBR compression and TPB creation. Advanced features and format support need additional development.
