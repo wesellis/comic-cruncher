@@ -26,9 +26,9 @@ jobs:
         
         # Copy assets with clean names
         mkdir -p _site/assets
-        cp "assets/ComicCruncher1.png" "_site/assets/ComicCruncher1.png"
-        cp "assets/ComicCombiner1.png" "_site/assets/ComicCombiner1.png"
-        cp "assets/ComicCombiner2.png" "_site/assets/ComicCombiner2.png"
+        cp "assets/pictures/ComicCruncher1.png" "_site/assets/ComicCruncher1.png"
+        cp "assets/pictures/ComicCombiner1.png" "_site/assets/ComicCombiner1.png"
+        cp "assets/pictures/ComicCombiner2.png" "_site/assets/ComicCombiner2.png"
         
         echo "Site built successfully with updated assets"
         
