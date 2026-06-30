@@ -24,7 +24,6 @@ MANIFEST
 
 # PyInstaller
 *.manifest
-*.spec
 
 # Unit test / coverage reports
 htmlcov/
@@ -80,3 +79,4 @@ temp_*
 # Build files
 *.exe
 *.msi
+bundled/

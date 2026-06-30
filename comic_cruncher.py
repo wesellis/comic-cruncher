@@ -9,21 +9,28 @@ from PIL import Image
 import pdf2image
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QProgressBar, QFrame, QTextEdit, QPushButton)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMimeData, QTimer
-from PyQt6.QtGui import QFont, QPixmap, QPainter, QColor, QPen, QDragEnterEvent, QDropEvent
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-import multiprocessing
-from functools import partial
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import io
 
-# GPU acceleration imports
+# Detect PyInstaller bundle for locating bundled binaries
+if getattr(sys, 'frozen', False):
+    _BUNDLE_DIR = Path(sys._MEIPASS)
+    _POPPLER_PATH = str(_BUNDLE_DIR / 'poppler')
+    rarfile.UNRAR_TOOL = str(_BUNDLE_DIR / 'unrar' / 'UnRAR.exe')
+else:
+    _BUNDLE_DIR = None
+    _POPPLER_PATH = None
+
+# OpenCV SIMD-optimized processing imports
 try:
     import cv2
     import numpy as np
-    GPU_AVAILABLE = True
+    OPENCV_AVAILABLE = True
 except ImportError:
-    GPU_AVAILABLE = False
+    OPENCV_AVAILABLE = False
 
 def format_file_size(size_bytes):
     """Convert bytes to human readable format"""
@@ -38,11 +45,18 @@ def format_file_size(size_bytes):
 
 class ComicCombiner(QThread):
     """Background thread for combining comic issues into TPB collections"""
-    
+
+    ISSUE_PATTERNS = [
+        r'(.+?)\s+(\d{3})(?:\s|$)',   # "Series Name 001"
+        r'(.+?)\s+Issue\s+(\d+)',      # "Series Name Issue 1"
+        r'(.+?)\s+#(\d+)',             # "Series Name #1"
+        r'(.+?)\s+(\d+)(?:\s|$)',      # "Series Name 1" (fallback)
+    ]
+
     progress_update = pyqtSignal(str, int)  # stage, percentage
     file_info_update = pyqtSignal(str)  # current file info
     finished = pyqtSignal(bool, str)  # success, message
-    
+
     def __init__(self, file_paths):
         super().__init__()
         self.file_paths = file_paths
@@ -85,23 +99,17 @@ class ComicCombiner(QThread):
                 batch_issues = []
                 for file_path in batch_files:
                     name = Path(file_path).stem
-                    for pattern in [
-                        r'(.+?)\s+(\d{3})(?:\s|$)',
-                        r'(.+?)\s+Issue\s+(\d+)',
-                        r'(.+?)\s+#(\d+)',
-                        r'(.+?)\s+(\d+)(?:\s|$)',
-                    ]:
+                    for pattern in self.ISSUE_PATTERNS:
                         match = re.search(pattern, name, re.IGNORECASE)
                         if match:
                             batch_issues.append(int(match.group(2)))
                             break
-                
+
+                volume_num = batch_idx + 1
                 if batch_issues:
                     issue_range = self.format_issue_range(batch_issues)
-                    volume_num = batch_idx + 1
                     tpb_name = f"{series_name} Vol {volume_num} (Issues {issue_range}).cbz"
                 else:
-                    volume_num = batch_idx + 1
                     tpb_name = f"{series_name} Vol {volume_num}.cbz"
                 
                 output_path = Path(batch_files[0]).parent / tpb_name
@@ -130,8 +138,8 @@ class ComicCombiner(QThread):
                         self.file_info_update.emit(f"Warning: No images found in Volume {volume_num}")
                         continue
                     
-                    # Create combined CBZ for this batch
-                    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as tpb:
+                    # Create combined CBZ for this batch - ZIP_STORED since images are pre-compressed
+                    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as tpb:
                         for img_path in sorted(all_images):
                             if os.path.exists(img_path):
                                 tpb.write(img_path, os.path.basename(img_path))
@@ -155,10 +163,10 @@ class ComicCombiner(QThread):
             
             self.finished.emit(True, message)
                 
-        except MemoryError as e:
-            self.finished.emit(False, f"Memory Error: Not enough memory to combine files. Try fewer files at once.")
-        except PermissionError as e:
-            self.finished.emit(False, f"Permission Error: Cannot access files. Check file permissions.")
+        except MemoryError:
+            self.finished.emit(False, "Memory Error: Not enough memory to combine files. Try fewer files at once.")
+        except PermissionError:
+            self.finished.emit(False, "Permission Error: Cannot access files. Check file permissions.")
         except Exception as e:
             self.finished.emit(False, f"Combination error: {str(e)}")
     
@@ -171,15 +179,7 @@ class ComicCombiner(QThread):
                 issue_num = None
                 series_name = None
                 
-                # Try multiple patterns for issue detection
-                patterns = [
-                    r'(.+?)\s+(\d{3})(?:\s|$)',  # Original: "Series Name 001"
-                    r'(.+?)\s+Issue\s+(\d+)',     # "Series Name Issue 1"
-                    r'(.+?)\s+#(\d+)',           # "Series Name #1"
-                    r'(.+?)\s+(\d+)(?:\s|$)',    # "Series Name 1" (fallback)
-                ]
-                
-                for pattern in patterns:
+                for pattern in self.ISSUE_PATTERNS:
                     match = re.search(pattern, name, re.IGNORECASE)
                     if match:
                         series_name = match.group(1).strip()
@@ -257,104 +257,76 @@ class ComicCombiner(QThread):
         return ", ".join(ranges)
     
     def extract_images_from_comic(self, file_path, temp_dir, issue_index):
-        """Extract images from a comic file"""
+        """Extract images from a comic file (handles misnamed archives and nested folders)"""
         images = []
         try:
             file_path = Path(file_path)
-            
-            if file_path.suffix.lower() == '.cbz':
-                with zipfile.ZipFile(file_path, 'r') as cbz:
-                    for filename in sorted(cbz.namelist()):
-                        if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp')):
-                            # Extract with unique name
-                            original_name = os.path.basename(filename)
-                            name, ext = os.path.splitext(original_name)
-                            unique_name = f"issue_{issue_index:03d}_{name}{ext}"
-                            
-                            cbz.extract(filename, path=temp_dir)
-                            old_path = os.path.join(temp_dir, filename)
-                            new_path = os.path.join(temp_dir, unique_name)
-                            
-                            os.rename(old_path, new_path)
-                            images.append(new_path)
-            
-            elif file_path.suffix.lower() == '.cbr':
-                with rarfile.RarFile(file_path, 'r') as cbr:
-                    for filename in sorted(cbr.namelist()):
-                        if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp')):
-                            original_name = os.path.basename(filename)
-                            name, ext = os.path.splitext(original_name)
-                            unique_name = f"issue_{issue_index:03d}_{name}{ext}"
-                            
-                            cbr.extract(filename, path=temp_dir)
-                            old_path = os.path.join(temp_dir, filename)
-                            new_path = os.path.join(temp_dir, unique_name)
-                            
-                            os.rename(old_path, new_path)
-                            images.append(new_path)
-        
+            archive, _ = ComicUtils._open_archive(file_path)
+            with archive:
+                page_num = 0
+                for filename in sorted(archive.namelist()):
+                    if ComicUtils.is_image_file(filename):
+                        original_name = os.path.basename(filename)
+                        _, ext = os.path.splitext(original_name)
+                        # Use sequential numbering to avoid collisions from nested folders
+                        unique_name = f"issue_{issue_index:03d}_page_{page_num:04d}{ext}"
+                        page_num += 1
+
+                        # Write bytes directly to avoid nested folder issues with extract()
+                        new_path = os.path.join(temp_dir, unique_name)
+                        with open(new_path, 'wb') as f:
+                            f.write(archive.read(filename))
+                        images.append(new_path)
+
         except Exception as e:
             print(f"Error extracting from {file_path}: {e}")
-        
+
         return images
     
     def stop(self):
         self.should_stop = True
 
 class ImageProcessor:
-    """Handles image processing with parallel execution and GPU acceleration"""
-    
+    """Handles image processing with parallel execution and optional OpenCV SIMD optimization"""
+
     @staticmethod
-    def process_image_gpu(image_data, target_size=2500, quality=85):
-        """GPU-accelerated image processing using OpenCV"""
-        if not GPU_AVAILABLE:
+    def process_image_opencv(image_data, target_size=2500, quality=85):
+        """OpenCV SIMD-optimized image processing. Accepts (name, bytes, temp_dir) tuple or PIL Image."""
+        if not OPENCV_AVAILABLE:
             return ImageProcessor.process_image(image_data, target_size, quality)
-        
+
         try:
             if isinstance(image_data, tuple):
-                image_path, temp_dir = image_data
-                try:
-                    # Use OpenCV for faster loading and processing
-                    img_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
-                    if img_bgr is None:
-                        # Fallback to PIL if OpenCV can't read
-                        return ImageProcessor.process_image(image_data, target_size, quality)
-                    
-                    # Convert BGR to RGB
-                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                    
-                    # Calculate new size maintaining aspect ratio
-                    height, width = img_rgb.shape[:2]
-                    if max(width, height) > target_size:
-                        if width > height:
-                            new_width = target_size
-                            new_height = int((height * target_size) / width)
-                        else:
-                            new_height = target_size
-                            new_width = int((width * target_size) / height)
-                        
-                        # GPU-accelerated resize using OpenCV
-                        img_rgb = cv2.resize(img_rgb, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
-                    
-                    # Convert back to PIL for WebP saving
-                    pil_image = Image.fromarray(img_rgb)
-                    
-                    # Save as WebP
-                    output_name = Path(image_path).stem + '.webp'
-                    output_path = os.path.join(temp_dir, output_name)
-                    pil_image.save(output_path, 'WEBP', quality=quality, optimize=True)
-                    return output_path
-                finally:
-                    # Clean up source file after processing
-                    try:
-                        os.remove(image_path)
-                    except (OSError, PermissionError):
-                        pass
+                name, img_bytes, temp_dir = image_data
+                # Decode bytes with OpenCV
+                arr = np.frombuffer(img_bytes, dtype=np.uint8)
+                img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img_bgr is None:
+                    return ImageProcessor.process_image(image_data, target_size, quality)
+
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+                height, width = img_rgb.shape[:2]
+                if max(width, height) > target_size:
+                    if width > height:
+                        new_width = target_size
+                        new_height = int((height * target_size) / width)
+                    else:
+                        new_height = target_size
+                        new_width = int((width * target_size) / height)
+                    img_rgb = cv2.resize(img_rgb, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
+
+                pil_image = Image.fromarray(img_rgb)
+                output_name = Path(name).stem + '.webp'
+                output_path = os.path.join(temp_dir, output_name)
+                pil_image.save(output_path, 'WEBP', quality=quality, optimize=True)
+                return output_path
             else:
-                # Direct PIL Image object - convert to numpy for GPU processing
-                img_array = np.array(image_data)
-                
-                # Calculate new size maintaining aspect ratio
+                # Direct PIL Image object
+                img = image_data
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    img = img.convert('RGB')
+                img_array = np.array(img)
                 height, width = img_array.shape[:2]
                 if max(width, height) > target_size:
                     if width > height:
@@ -363,56 +335,22 @@ class ImageProcessor:
                     else:
                         new_height = target_size
                         new_width = int((width * target_size) / height)
-                    
-                    # GPU-accelerated resize
                     img_array = cv2.resize(img_array, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
-                
                 return Image.fromarray(img_array)
         except Exception as e:
-            print(f"GPU processing failed, falling back to CPU: {e}")
+            print(f"OpenCV processing failed, falling back to PIL: {e}")
             return ImageProcessor.process_image(image_data, target_size, quality)
-    
+
     @staticmethod
     def process_image(image_data, target_size=2500, quality=85):
-        """Process a single image: resize and convert to WebP"""
+        """Process a single image: resize and convert to WebP. Accepts (name, bytes, temp_dir) tuple or PIL Image."""
         try:
             if isinstance(image_data, tuple):
-                image_path, temp_dir = image_data
-                try:
-                    with Image.open(image_path) as img:
-                        # Convert to RGB if necessary
-                        if img.mode in ('RGBA', 'LA', 'P'):
-                            img = img.convert('RGB')
-                        
-                        # Calculate new size maintaining aspect ratio
-                        width, height = img.size
-                        if max(width, height) > target_size:
-                            if width > height:
-                                new_width = target_size
-                                new_height = int((height * target_size) / width)
-                            else:
-                                new_height = target_size
-                                new_width = int((width * target_size) / height)
-                            
-                            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                        
-                        # Save as WebP
-                        output_name = Path(image_path).stem + '.webp'
-                        output_path = os.path.join(temp_dir, output_name)
-                        img.save(output_path, 'WEBP', quality=quality, optimize=True)
-                        return output_path
-                finally:
-                    # Clean up source file after processing
-                    try:
-                        os.remove(image_path)
-                    except (OSError, PermissionError):
-                        pass  # File might already be gone or locked
-            else:
-                # Direct PIL Image object
-                img = image_data
+                name, img_bytes, temp_dir = image_data
+                img = Image.open(io.BytesIO(img_bytes))
                 if img.mode in ('RGBA', 'LA', 'P'):
                     img = img.convert('RGB')
-                
+
                 width, height = img.size
                 if max(width, height) > target_size:
                     if width > height:
@@ -421,19 +359,175 @@ class ImageProcessor:
                     else:
                         new_height = target_size
                         new_width = int((width * target_size) / height)
-                    
                     img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                
+
+                output_name = Path(name).stem + '.webp'
+                output_path = os.path.join(temp_dir, output_name)
+                img.save(output_path, 'WEBP', quality=quality, optimize=True)
+                return output_path
+            else:
+                # Direct PIL Image object
+                img = image_data
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    img = img.convert('RGB')
+
+                width, height = img.size
+                if max(width, height) > target_size:
+                    if width > height:
+                        new_width = target_size
+                        new_height = int((height * target_size) / width)
+                    else:
+                        new_height = target_size
+                        new_width = int((width * target_size) / height)
+                    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
                 return img
         except Exception as e:
             print(f"Error processing image: {e}")
             return None
+
+class OrderedZipWriter:
+    """Buffers out-of-order results and writes them to a ZIP in index order."""
+
+    def __init__(self, zip_path):
+        self.zip_path = zip_path
+        self.zf = zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED)
+        self.next_index = 0
+        self.buffer = {}
+
+    def submit(self, index, file_path):
+        """Submit a processed image. Writes immediately if in order, buffers otherwise."""
+        self.buffer[index] = file_path
+        self._flush()
+
+    def _flush(self):
+        """Write buffered entries in order."""
+        while self.next_index in self.buffer:
+            file_path = self.buffer.pop(self.next_index)
+            if os.path.exists(file_path):
+                self.zf.write(file_path, os.path.basename(file_path))
+                try:
+                    os.remove(file_path)
+                except (OSError, PermissionError):
+                    pass
+            self.next_index += 1
+
+    def close(self):
+        if self.zf is None:
+            return
+        self._flush()
+        self.zf.close()
+        self.zf = None
+
+
+class ComicUtils:
+    """Shared utility methods for comic processing classes"""
+
+    IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tif', '.tiff')
+
+    @staticmethod
+    def is_image_file(filename):
+        """Check if a filename has an image extension"""
+        return filename.lower().endswith(ComicUtils.IMAGE_EXTENSIONS)
+
+    @staticmethod
+    def _open_archive(file_path):
+        """Open an archive, trying the expected format first then falling back.
+        Returns (archive, format) or raises on failure."""
+        ext = file_path.suffix.lower()
+        # Try expected format first, then fallback
+        if ext == '.cbz':
+            try:
+                return zipfile.ZipFile(file_path, 'r'), 'zip'
+            except zipfile.BadZipFile:
+                return rarfile.RarFile(file_path, 'r'), 'rar'
+        elif ext == '.cbr':
+            try:
+                return rarfile.RarFile(file_path, 'r'), 'rar'
+            except (rarfile.NotRarFile, rarfile.BadRarFile):
+                return zipfile.ZipFile(file_path, 'r'), 'zip'
+        raise ValueError(f"Unsupported archive format: {ext}")
+
+    @staticmethod
+    def _flat_name(filename):
+        """Flatten an archive path into a single filename, preserving sort order.
+        e.g. 'chapter1/page01.jpg' → 'chapter1_page01.jpg'"""
+        # Normalize separators and strip leading slashes
+        flat = filename.replace('\\', '/').strip('/')
+        flat = flat.replace('/', '_')
+        return flat
+
+    @staticmethod
+    def is_already_crunched(file_path):
+        """Check if file already contains WebP images"""
+        try:
+            if file_path.suffix.lower() == '.pdf':
+                return False
+            archive, _ = ComicUtils._open_archive(file_path)
+            with archive:
+                image_files = [f for f in archive.namelist() if ComicUtils.is_image_file(f)]
+                if not image_files:
+                    return False
+                webp_count = sum(1 for f in image_files if f.lower().endswith('.webp'))
+                return (webp_count / len(image_files)) > 0.8
+        except Exception:
+            return False
+
+    @staticmethod
+    def extract_images(archive_path, progress_callback=None):
+        """Extract images from CBZ/CBR (auto-detects format), returns [(filename, bytes), ...]"""
+        results = []
+        try:
+            archive, _ = ComicUtils._open_archive(archive_path)
+            with archive:
+                image_names = sorted(f for f in archive.namelist() if ComicUtils.is_image_file(f))
+                total = len(image_names)
+                for i, filename in enumerate(image_names):
+                    flat = ComicUtils._flat_name(filename)
+                    results.append((flat, archive.read(filename)))
+                    if progress_callback and total > 0:
+                        progress_callback(i + 1, total)
+            return results
+        except Exception as e:
+            print(f"Error extracting from {archive_path}: {e}")
+            return []
+
+    @staticmethod
+    def iter_pdf_pages(pdf_path, batch_size=5, should_stop=None, progress_callback=None):
+        """Generator that yields (page_index, pil_image) from a PDF"""
+        try:
+            info = pdf2image.pdfinfo_from_path(pdf_path, poppler_path=_POPPLER_PATH)
+            max_pages = info["Pages"]
+
+            page_index = 0
+            for i in range(0, max_pages, batch_size):
+                if should_stop and should_stop():
+                    return
+
+                batch = pdf2image.convert_from_path(
+                    pdf_path, dpi=300,
+                    first_page=i + 1,
+                    last_page=min(i + batch_size, max_pages),
+                    poppler_path=_POPPLER_PATH
+                )
+                for img in batch:
+                    yield (page_index, img)
+                    page_index += 1
+
+                if progress_callback:
+                    progress_callback(min(i + batch_size, max_pages), max_pages)
+
+                del batch
+        except Exception as e:
+            print(f"Error extracting from PDF: {e}")
+
 
 class BatchProcessor(QThread):
     """Background thread for processing multiple comic files"""
     
     progress_update = pyqtSignal(str, int)  # stage, percentage
     file_info_update = pyqtSignal(str)  # current file info
+    file_progress = pyqtSignal(str, int)  # filename, percentage (0-100)
     batch_progress = pyqtSignal(int, int)  # current file, total files
     finished = pyqtSignal(bool, str)  # success, message
     
@@ -446,62 +540,73 @@ class BatchProcessor(QThread):
         self.error_count = 0
         self.total_space_saved = 0
     
+    def _handle_result(self, file_path, result):
+        """Process a single file result and update counters (called from main run thread)."""
+        file_name = Path(file_path).name
+        if result == "skipped":
+            self.skipped_count += 1
+            self.file_info_update.emit(f"Skipped: {file_name} (already crunched)")
+        elif isinstance(result, tuple) and result[0] == "error":
+            self.error_count += 1
+            self.file_info_update.emit(f"Error: {file_name} - {result[1]}")
+        elif isinstance(result, tuple) and len(result) == 3:
+            self.processed_count += 1
+            original_size, new_size = result[1], result[2]
+            space_saved = original_size - new_size
+            self.total_space_saved += space_saved
+            if original_size > 0:
+                percent_saved = int((space_saved / original_size) * 100)
+                size_info = f"({format_file_size(original_size)} → {format_file_size(new_size)}, {percent_saved}% saved)"
+            else:
+                size_info = ""
+            self.file_info_update.emit(f"Completed: {file_name} {size_info}")
+        elif result == "success":
+            self.processed_count += 1
+            self.file_info_update.emit(f"Completed: {file_name}")
+        else:
+            self.error_count += 1
+            self.file_info_update.emit(f"Error: {file_name} (unknown error)")
+
     def run(self):
         try:
             total_files = len(self.file_paths)
             self.file_info_update.emit(f"Starting batch: {total_files} files found")
-            
-            for i, file_path in enumerate(self.file_paths):
-                if self.should_stop:
-                    break
-                
-                self.batch_progress.emit(i + 1, total_files)
-                
-                # Update with current file being processed
-                file_name = Path(file_path).name
-                self.file_info_update.emit(f"Processing: {file_name}")
-                
-                # Process single file
-                result = self.process_single_file(file_path)
-                
-                # Update with result
-                if result == "success":
-                    self.processed_count += 1
-                    self.file_info_update.emit(f"Completed: {file_name}")
-                elif result == "skipped":
-                    self.skipped_count += 1
-                    self.file_info_update.emit(f"Skipped: {file_name} (already crunched)")
-                elif isinstance(result, tuple) and result[0] == "error":
-                    self.error_count += 1
-                    error_detail = result[1]
-                    self.file_info_update.emit(f"Error: {file_name} - {error_detail}")
-                elif isinstance(result, tuple) and len(result) == 3:
-                    # Result with file size info (success, original_size, new_size)
-                    self.processed_count += 1
-                    original_size, new_size = result[1], result[2]
-                    space_saved = original_size - new_size
-                    self.total_space_saved += space_saved
-                    
-                    if original_size > 0:
-                        percent_saved = int((space_saved / original_size) * 100)
-                        size_info = f"({format_file_size(original_size)} → {format_file_size(new_size)}, {percent_saved}% saved)"
-                    else:
-                        size_info = ""
-                    
-                    self.file_info_update.emit(f"Completed: {file_name} {size_info}")
-                else:
-                    self.error_count += 1
-                    self.file_info_update.emit(f"Error: {file_name} (unknown error)")
-            
+
+            max_concurrent = max(1, min(3, os.cpu_count() // 4))
+            completed_count = 0
+
+            with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+                future_to_path = {}
+                for file_path in self.file_paths:
+                    if self.should_stop:
+                        break
+                    file_name = Path(file_path).name
+                    self.file_info_update.emit(f"Processing: {file_name}")
+                    future = executor.submit(self.process_single_file, file_path)
+                    future_to_path[future] = file_path
+
+                for future in as_completed(future_to_path):
+                    if self.should_stop:
+                        break
+                    file_path = future_to_path[future]
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        result = ("error", str(e))
+
+                    completed_count += 1
+                    self.batch_progress.emit(completed_count, total_files)
+                    self._handle_result(file_path, result)
+
             # Generate summary message
             summary = f"Batch complete! Processed: {self.processed_count}, Skipped: {self.skipped_count}"
             if self.error_count > 0:
                 summary += f", Errors: {self.error_count}"
             if self.total_space_saved > 0:
                 summary += f" | Space saved: {format_file_size(self.total_space_saved)}"
-            
+
             self.finished.emit(True, summary)
-            
+
         except Exception as e:
             self.finished.emit(False, f"Batch error: {str(e)}")
     
@@ -514,7 +619,7 @@ class BatchProcessor(QThread):
             original_size = file_path.stat().st_size
             
             # Check if already crunched
-            if self.is_already_crunched(file_path):
+            if ComicUtils.is_already_crunched(file_path):
                 return "skipped"
             
             # Create backup
@@ -523,355 +628,285 @@ class BatchProcessor(QThread):
             
             # Extract images
             if file_path.suffix.lower() == '.pdf':
-                images = self.extract_from_pdf(file_path)
-            elif file_path.suffix.lower() == '.cbz':
-                images = self.extract_from_cbz(file_path)
-            elif file_path.suffix.lower() == '.cbr':
-                images = self.extract_from_cbr(file_path)
+                images = list(ComicUtils.iter_pdf_pages(file_path, should_stop=lambda: self.should_stop))
+            elif file_path.suffix.lower() in ('.cbz', '.cbr'):
+                images = ComicUtils.extract_images(file_path)
             else:
                 return ("error", "Unsupported file format")
-            
+
             if not images:
                 return ("error", "No images found in file")
-            
+
             # Process images
+            process_func = ImageProcessor.process_image_opencv if OPENCV_AVAILABLE else ImageProcessor.process_image
+            max_concurrent = max(1, min(3, os.cpu_count() // 4))
+            inner_workers = max(2, os.cpu_count() // max_concurrent)
+
+            file_name = file_path.name
+            self.file_progress.emit(file_name, 5)
+
             with tempfile.TemporaryDirectory() as temp_dir:
                 processed_images = []
-                
+                total_images = len(images)
+
                 if file_path.suffix.lower() == '.pdf':
-                    for i, img in enumerate(images):
-                        processed_img = ImageProcessor.process_image(img)
-                        if processed_img:
-                            output_path = os.path.join(temp_dir, f"page_{i:04d}.webp")
-                            processed_img.save(output_path, 'WEBP', quality=85, optimize=True)
-                            processed_images.append(output_path)
-                else:
-                    image_tasks = [(img_path, temp_dir) for img_path in images]
-                    with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-                        # Use GPU acceleration if available
-                        process_func = ImageProcessor.process_image_gpu if GPU_AVAILABLE else ImageProcessor.process_image
-                        futures = [executor.submit(process_func, task) for task in image_tasks]
-                        for future in futures:
+                    with ThreadPoolExecutor(max_workers=inner_workers) as executor:
+                        futures = {executor.submit(self._process_pdf_page, img, temp_dir, idx, process_func): idx
+                                   for idx, img in images}
+                        done_count = 0
+                        for future in as_completed(futures):
                             result = future.result()
                             if result:
                                 processed_images.append(result)
-                
+                            done_count += 1
+                            pct = 5 + int(done_count / total_images * 85)
+                            self.file_progress.emit(file_name, pct)
+                else:
+                    image_tasks = [(name, img_bytes, temp_dir) for name, img_bytes in images]
+                    with ThreadPoolExecutor(max_workers=inner_workers) as executor:
+                        futures = {executor.submit(process_func, task): i
+                                   for i, task in enumerate(image_tasks)}
+                        done_count = 0
+                        for future in as_completed(futures):
+                            result = future.result()
+                            if result:
+                                processed_images.append(result)
+                            done_count += 1
+                            pct = 5 + int(done_count / total_images * 85)
+                            self.file_progress.emit(file_name, pct)
+
                 if not processed_images:
                     return ("error", "Failed to process any images")
-                
-                # Create CBZ with optimized compression
+
+                self.file_progress.emit(file_name, 92)
+
+                # Create CBZ - ZIP_STORED since WebP is pre-compressed
                 temp_cbz_path = file_path.parent / f"temp_{file_path.stem}.cbz"
-                with zipfile.ZipFile(temp_cbz_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as cbz:
+                with zipfile.ZipFile(temp_cbz_path, 'w', zipfile.ZIP_STORED) as cbz:
                     for img_path in sorted(processed_images):
                         if os.path.exists(img_path):
-                            # Use minimal compression for WebP files (already compressed)
                             cbz.write(img_path, os.path.basename(img_path))
-                
-                # Clean up temp directories created during extraction
-                self.cleanup_temp_directories(images)
-                
+
                 # Replace original
                 final_path = file_path.with_suffix('.cbz') if file_path.suffix.lower() != '.cbz' else file_path
                 if final_path.exists():
                     os.remove(final_path)
                 os.rename(temp_cbz_path, final_path)
-                
+
                 if file_path.suffix.lower() != '.cbz' and file_path.exists():
                     os.remove(file_path)
-                
-                # Clean up backup
+
                 if backup_path.exists():
                     os.remove(backup_path)
-                
-                # Get new file size
+
                 new_size = final_path.stat().st_size
-                
                 return ("success", original_size, new_size)
-                
+
         except PermissionError as e:
-            # Clean up temp directories on error
-            if 'images' in locals():
-                self.cleanup_temp_directories(images)
+            self._cleanup_backup(backup_path)
             return ("error", f"Permission denied: {str(e)}")
         except FileNotFoundError as e:
+            self._cleanup_backup(backup_path)
             return ("error", f"File not found: {str(e)}")
         except zipfile.BadZipFile as e:
+            self._cleanup_backup(backup_path)
             return ("error", f"Corrupted archive: {str(e)}")
         except Exception as e:
-            # Clean up temp directories on error
-            if 'images' in locals():
-                self.cleanup_temp_directories(images)
+            self._cleanup_backup(backup_path)
             return ("error", f"Processing failed: {str(e)}")
-    
+
+    @staticmethod
+    def _process_pdf_page(pil_image, temp_dir, index, process_func):
+        """Process a single PDF page image."""
+        try:
+            processed_img = process_func(pil_image)
+            if processed_img:
+                output_path = os.path.join(temp_dir, f"page_{index:04d}.webp")
+                processed_img.save(output_path, 'WEBP', quality=85, optimize=True)
+                return output_path
+        except Exception as e:
+            print(f"Error processing PDF page {index}: {e}")
+        return None
+
+    @staticmethod
+    def _cleanup_backup(backup_path):
+        """Remove backup file if it exists."""
+        try:
+            if backup_path and backup_path.exists():
+                os.remove(backup_path)
+        except OSError:
+            pass
+
     def stop(self):
         self.should_stop = True
-    
-    def cleanup_temp_directories(self, image_paths):
-        """Clean up temporary directories created during extraction"""
-        temp_dirs = set()
-        for img_path in image_paths:
-            # Get the parent directory of each image
-            parent_dir = os.path.dirname(img_path)
-            # Check if it's a temp directory we created
-            if "comic_cruncher_" in parent_dir:
-                temp_dirs.add(parent_dir)
-        
-        # Remove all temp directories
-        for temp_dir in temp_dirs:
-            try:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception as e:
-                print(f"Warning: Could not clean up temp directory {temp_dir}: {e}")
-    
-    # Copy utility methods from ComicProcessor
-    def is_already_crunched(self, file_path):
-        """Check if file already contains WebP images"""
-        try:
-            if file_path.suffix.lower() == '.pdf':
-                return False
-            elif file_path.suffix.lower() == '.cbz':
-                with zipfile.ZipFile(file_path, 'r') as cbz:
-                    image_files = [f for f in cbz.namelist() 
-                                 if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp'))]
-                    if not image_files:
-                        return False
-                    webp_count = sum(1 for f in image_files if f.lower().endswith('.webp'))
-                    return (webp_count / len(image_files)) > 0.8
-            elif file_path.suffix.lower() == '.cbr':
-                with rarfile.RarFile(file_path, 'r') as cbr:
-                    image_files = [f for f in cbr.namelist() 
-                                 if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp'))]
-                    if not image_files:
-                        return False
-                    webp_count = sum(1 for f in image_files if f.lower().endswith('.webp'))
-                    return (webp_count / len(image_files)) > 0.8
-            return False
-        except Exception:
-            return False
-    
-    def extract_from_pdf(self, pdf_path):
-        """Extract images from PDF with batch processing to prevent memory issues"""
-        try:
-            # Get total pages first
-            info = pdf2image.pdfinfo_from_path(pdf_path)
-            max_pages = info["Pages"]
-            batch_size = 5  # Process 5 pages at a time
-            images = []
-            
-            for i in range(0, max_pages, batch_size):
-                if self.should_stop:
-                    return images
-                    
-                # Process batch
-                batch = pdf2image.convert_from_path(
-                    pdf_path, dpi=300,
-                    first_page=i+1, 
-                    last_page=min(i+batch_size, max_pages)
-                )
-                images.extend(batch)
-                del batch  # Free memory immediately
-            
-            return images
-        except (pdf2image.exceptions.PDFInfoNotInstalledError, pdf2image.exceptions.PDFPageCountError) as e:
-            print(f"PDF processing error: {e}")
-            return []
-        except Exception as e:
-            print(f"Unexpected error extracting from PDF: {e}")
-            return []
-    
-    def extract_from_cbz(self, cbz_path):
-        images = []
-        try:
-            # Create persistent temp directory
-            temp_dir = tempfile.mkdtemp(prefix="comic_cruncher_")
-            with zipfile.ZipFile(cbz_path, 'r') as cbz:
-                for filename in sorted(cbz.namelist()):
-                    if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp')):
-                        cbz.extract(filename, path=temp_dir)
-                        images.append(os.path.join(temp_dir, filename))
-            return images
-        except Exception as e:
-            print(f"Error extracting from CBZ {cbz_path}: {e}")
-            return []
-    
-    def extract_from_cbr(self, cbr_path):
-        images = []
-        try:
-            # Create persistent temp directory
-            temp_dir = tempfile.mkdtemp(prefix="comic_cruncher_")
-            with rarfile.RarFile(cbr_path, 'r') as cbr:
-                for filename in sorted(cbr.namelist()):
-                    if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp')):
-                        cbr.extract(filename, path=temp_dir)
-                        images.append(os.path.join(temp_dir, filename))
-            return images
-        except Exception as e:
-            print(f"Error extracting from CBR {cbr_path}: {e}")
-            return []
 
 class ComicProcessor(QThread):
     """Background thread for processing comic files"""
-    
+
     progress_update = pyqtSignal(str, int)  # stage, percentage
     file_info_update = pyqtSignal(str)  # file path
     finished = pyqtSignal(bool, str)  # success, message
-    
+
     def __init__(self, file_path):
         super().__init__()
         self.file_path = file_path
         self.should_stop = False
-    
+
     def run(self):
         try:
             file_path = Path(self.file_path)
             self.file_info_update.emit(str(file_path))
-            
+
             # Check if file is already crunched (contains WebP images)
-            if self.is_already_crunched(file_path):
+            if ComicUtils.is_already_crunched(file_path):
                 self.finished.emit(True, "File already crunched with WebP images!")
                 return
-            
+
             # Create backup
             backup_path = file_path.with_suffix(file_path.suffix + '.backup')
             shutil.copy2(file_path, backup_path)
-            
+
             # Determine file type and extract images
+            self.progress_update.emit("RESIZING", 5)
+            extract_last_pct = -1
+
+            def extract_progress(done, total):
+                nonlocal extract_last_pct
+                pct = 5 + int((done / total) * 5)  # 5% to 10%
+                if pct != extract_last_pct:
+                    extract_last_pct = pct
+                    self.progress_update.emit("RESIZING", pct)
+
             if file_path.suffix.lower() == '.pdf':
-                images = self.extract_from_pdf(file_path)
-            elif file_path.suffix.lower() == '.cbz':
-                images = self.extract_from_cbz(file_path)
-            elif file_path.suffix.lower() == '.cbr':
-                images = self.extract_from_cbr(file_path)
+                is_pdf = True
+                images = None  # Will use streaming generator
+            elif file_path.suffix.lower() in ('.cbz', '.cbr'):
+                is_pdf = False
+                images = ComicUtils.extract_images(file_path, progress_callback=extract_progress)
             else:
                 self.finished.emit(False, "Unsupported file format")
                 return
-            
-            if not images:
+
+            if not is_pdf and not images:
                 self.finished.emit(False, "No images found in file")
                 return
-            
-            # Process images in parallel
+
+            # Process images and stream to ZIP
+            temp_cbz_path = file_path.parent / f"temp_{file_path.stem}.cbz"
             with tempfile.TemporaryDirectory() as temp_dir:
                 self.progress_update.emit("RESIZING", 10)
-                
-                # Prepare image processing tasks
-                if file_path.suffix.lower() == '.pdf':
-                    # For PDF, images are PIL objects
-                    processed_images = []
-                    total_images = len(images)
-                    
-                    with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-                        futures = []
-                        for i, img in enumerate(images):
-                            future = executor.submit(self.process_pdf_image, img, temp_dir, i)
-                            futures.append(future)
-                        
-                        for i, future in enumerate(futures):
-                            if self.should_stop:
+                zip_writer = OrderedZipWriter(temp_cbz_path)
+
+                try:
+                    if is_pdf:
+                        last_progress = -1
+
+                        def pdf_progress(done, total):
+                            nonlocal last_progress
+                            pct = 5 + int((done / total) * 10)
+                            pct = min(pct, 15)
+                            if pct != last_progress:
+                                last_progress = pct
+                                self.progress_update.emit("RESIZING", pct)
+
+                        with ThreadPoolExecutor(max_workers=os.cpu_count() * 2) as executor:
+                            futures = {}
+                            for page_idx, img in ComicUtils.iter_pdf_pages(
+                                file_path, should_stop=lambda: self.should_stop,
+                                progress_callback=pdf_progress
+                            ):
+                                future = executor.submit(self.process_pdf_image, img, temp_dir, page_idx)
+                                futures[future] = page_idx
+
+                            total_futures = len(futures)
+                            if total_futures == 0:
+                                zip_writer.close()
+                                try:
+                                    os.remove(temp_cbz_path)
+                                except OSError:
+                                    pass
+                                self.finished.emit(False, "No images found in file")
                                 return
-                            result = future.result()
-                            if result:
-                                processed_images.append(result)
-                            
-                            progress = 10 + int((i + 1) / total_images * 50)
-                            self.progress_update.emit("RESIZING", progress)
-                else:
-                    # For CBZ/CBR, images are file paths
-                    image_tasks = [(img_path, temp_dir) for img_path in images]
-                    
-                    with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-                        # Use GPU acceleration if available
-                        process_func = ImageProcessor.process_image_gpu if GPU_AVAILABLE else ImageProcessor.process_image
-                        futures = [executor.submit(process_func, task) for task in image_tasks]
-                        
-                        processed_images = []
-                        for i, future in enumerate(futures):
-                            if self.should_stop:
-                                return
-                            result = future.result()
-                            if result:
-                                processed_images.append(result)
-                            
-                            progress = 10 + int((i + 1) / len(futures) * 50)
-                            self.progress_update.emit("RESIZING", progress)
-                
-                self.progress_update.emit("RESIZING", 60)
-                self.progress_update.emit("COMPRESSING", 70)
-                
-                # Create new CBZ file
-                self.progress_update.emit("REPACKAGING", 85)
-                
-                # Create temporary CBZ file first
-                temp_cbz_path = file_path.parent / f"temp_{file_path.stem}.cbz"
-                
-                with zipfile.ZipFile(temp_cbz_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as cbz:
-                    for img_path in sorted(processed_images):
-                        if self.should_stop:
-                            return
-                        if os.path.exists(img_path):
-                            arcname = os.path.basename(img_path)
-                            # Use minimal compression for WebP files (already compressed)
-                            cbz.write(img_path, arcname)
-                
+
+                            for i, future in enumerate(futures):
+                                if self.should_stop:
+                                    zip_writer.close()
+                                    return
+                                result = future.result()
+                                if result:
+                                    zip_writer.submit(futures[future], result)
+
+                                progress = 10 + int((i + 1) / total_futures * 50)
+                                if progress != last_progress:
+                                    last_progress = progress
+                                    self.progress_update.emit("RESIZING", progress)
+                    else:
+                        # For CBZ/CBR, images are (name, bytes) tuples
+                        image_tasks = [(name, img_bytes, temp_dir) for name, img_bytes in images]
+
+                        with ThreadPoolExecutor(max_workers=os.cpu_count() * 2) as executor:
+                            process_func = ImageProcessor.process_image_opencv if OPENCV_AVAILABLE else ImageProcessor.process_image
+                            futures = {executor.submit(process_func, task): idx for idx, task in enumerate(image_tasks)}
+
+                            last_progress = -1
+                            for i, future in enumerate(futures):
+                                if self.should_stop:
+                                    zip_writer.close()
+                                    return
+                                result = future.result()
+                                if result:
+                                    zip_writer.submit(futures[future], result)
+
+                                progress = 10 + int((i + 1) / len(futures) * 50)
+                                if progress != last_progress:
+                                    last_progress = progress
+                                    self.progress_update.emit("RESIZING", progress)
+
+                    self.progress_update.emit("RESIZING", 60)
+                    self.progress_update.emit("COMPRESSING", 70)
+                    self.progress_update.emit("REPACKAGING", 85)
+                finally:
+                    zip_writer.close()
+
                 self.progress_update.emit("REPACKAGING", 95)
-                
+
                 # Determine final file path
                 if file_path.suffix.lower() != '.cbz':
-                    # Convert PDF/CBR to CBZ - replace with .cbz extension
                     final_path = file_path.with_suffix('.cbz')
                 else:
-                    # Keep original CBZ path
                     final_path = file_path
-                
-                # Remove existing final file if it exists
+
                 if final_path.exists():
                     os.remove(final_path)
-                
-                # Move temp file to final location
+
                 os.rename(temp_cbz_path, final_path)
-                
-                # Remove original file if it was a different format
+
                 if file_path.suffix.lower() != '.cbz' and file_path.exists():
                     os.remove(file_path)
-                
-                # Clean up backup file after successful processing
+
                 if backup_path.exists():
                     os.remove(backup_path)
-                
-                # Clean up temporary extraction directories
-                self.cleanup_temp_directories(images)
-                
+
                 self.progress_update.emit("REPACKAGING", 100)
                 self.finished.emit(True, "Comic processed successfully!")
-                
-        except MemoryError as e:
-            self.finished.emit(False, f"Memory Error: File too large. Try reducing batch size or closing other applications.")
-        except PermissionError as e:
-            self.finished.emit(False, f"Permission Error: Cannot access file. Check file permissions and try again.")
-        except FileNotFoundError as e:
-            self.finished.emit(False, f"File Error: File not found or moved during processing.")
+
+        except MemoryError:
+            self.finished.emit(False, "Memory Error: File too large. Try reducing batch size or closing other applications.")
+        except PermissionError:
+            self.finished.emit(False, "Permission Error: Cannot access file. Check file permissions and try again.")
+        except FileNotFoundError:
+            self.finished.emit(False, "File Error: File not found or moved during processing.")
         except Exception as e:
-            # Clean up temp directories on error
-            if 'images' in locals():
-                self.cleanup_temp_directories(images)
             self.finished.emit(False, f"Error: {str(e)}")
-        finally:
-            # Cleanup any remaining temp files
-            try:
-                if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
-                    shutil.rmtree(self.temp_dir, ignore_errors=True)
-            except:
-                pass
-    
+
     def process_pdf_image(self, pil_image, temp_dir, index):
-        """Process a single PDF image with GPU acceleration"""
+        """Process a single PDF image"""
         try:
-            # Use GPU acceleration if available
-            if GPU_AVAILABLE:
-                processed_img = ImageProcessor.process_image_gpu(pil_image)
+            if OPENCV_AVAILABLE:
+                processed_img = ImageProcessor.process_image_opencv(pil_image)
             else:
                 processed_img = ImageProcessor.process_image(pil_image)
-            
+
             if processed_img:
                 output_path = os.path.join(temp_dir, f"page_{index:04d}.webp")
                 processed_img.save(output_path, 'WEBP', quality=85, optimize=True)
@@ -879,124 +914,9 @@ class ComicProcessor(QThread):
         except Exception as e:
             print(f"Error processing PDF image {index}: {e}")
         return None
-    
-    def extract_from_pdf(self, pdf_path):
-        """Extract images from PDF with batch processing to prevent memory issues"""
-        self.progress_update.emit("RESIZING", 5)
-        try:
-            # Get total pages first
-            info = pdf2image.pdfinfo_from_path(pdf_path)
-            max_pages = info["Pages"]
-            batch_size = 5  # Process 5 pages at a time
-            images = []
-            
-            for i in range(0, max_pages, batch_size):
-                if self.should_stop:
-                    return images
-                    
-                # Process batch
-                batch = pdf2image.convert_from_path(
-                    pdf_path, dpi=300,
-                    first_page=i+1, 
-                    last_page=min(i+batch_size, max_pages)
-                )
-                images.extend(batch)
-                
-                # Update progress
-                progress = 5 + int(((i + batch_size) / max_pages) * 10)
-                self.progress_update.emit("RESIZING", min(progress, 15))
-                
-                del batch  # Free memory immediately
-            
-            return images
-        except Exception as e:
-            print(f"Error extracting from PDF: {e}")
-            return []
-    
-    def extract_from_cbz(self, cbz_path):
-        """Extract images from CBZ"""
-        self.progress_update.emit("RESIZING", 5)
-        images = []
-        try:
-            # Create a persistent temp directory
-            temp_dir = tempfile.mkdtemp(prefix="comic_processor_")
-            with zipfile.ZipFile(cbz_path, 'r') as cbz:
-                for filename in sorted(cbz.namelist()):
-                    if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp')):
-                        cbz.extract(filename, path=temp_dir)
-                        images.append(os.path.join(temp_dir, filename))
-            return images
-        except Exception as e:
-            print(f"Error extracting from CBZ: {e}")
-            return []
-    
-    def extract_from_cbr(self, cbr_path):
-        """Extract images from CBR"""
-        self.progress_update.emit("RESIZING", 5)
-        images = []
-        try:
-            # Create a persistent temp directory
-            temp_dir = tempfile.mkdtemp(prefix="comic_processor_")
-            with rarfile.RarFile(cbr_path, 'r') as cbr:
-                for filename in sorted(cbr.namelist()):
-                    if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp')):
-                        cbr.extract(filename, path=temp_dir)
-                        images.append(os.path.join(temp_dir, filename))
-            return images
-        except Exception as e:
-            print(f"Error extracting from CBR: {e}")
-            return []
-    
+
     def stop(self):
         self.should_stop = True
-    
-    def cleanup_temp_directories(self, image_paths):
-        """Clean up temporary directories created during extraction"""
-        temp_dirs = set()
-        for img_path in image_paths:
-            # Get the parent directory of each image
-            parent_dir = os.path.dirname(img_path)
-            # Check if it's a temp directory we created
-            if "comic_processor_" in parent_dir:
-                temp_dirs.add(parent_dir)
-        
-        # Remove all temp directories
-        for temp_dir in temp_dirs:
-            try:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception as e:
-                print(f"Warning: Could not clean up temp directory {temp_dir}: {e}")
-    
-    def is_already_crunched(self, file_path):
-        """Check if file already contains WebP images"""
-        try:
-            if file_path.suffix.lower() == '.pdf':
-                # PDFs are never pre-crunched
-                return False
-            elif file_path.suffix.lower() == '.cbz':
-                # Check CBZ contents
-                with zipfile.ZipFile(file_path, 'r') as cbz:
-                    image_files = [f for f in cbz.namelist() 
-                                 if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp'))]
-                    if not image_files:
-                        return False
-                    # If more than 80% are WebP, consider it already crunched
-                    webp_count = sum(1 for f in image_files if f.lower().endswith('.webp'))
-                    return (webp_count / len(image_files)) > 0.8
-            elif file_path.suffix.lower() == '.cbr':
-                # Check CBR contents
-                with rarfile.RarFile(file_path, 'r') as cbr:
-                    image_files = [f for f in cbr.namelist() 
-                                 if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp'))]
-                    if not image_files:
-                        return False
-                    # If more than 80% are WebP, consider it already crunched
-                    webp_count = sum(1 for f in image_files if f.lower().endswith('.webp'))
-                    return (webp_count / len(image_files)) > 0.8
-            return False
-        except Exception as e:
-            print(f"Error checking if file is crunched: {e}")
-            return False
 
 class DragDropFrame(QFrame):
     """Custom frame for drag and drop functionality"""
@@ -1047,6 +967,7 @@ class DragDropFrame(QFrame):
                     file_paths.append(path)
             
             if file_paths:
+                file_paths.sort()
                 self.file_dropped.emit(file_paths)
 
 class ComicCruncher(QMainWindow):
@@ -1054,6 +975,7 @@ class ComicCruncher(QMainWindow):
         super().__init__()
         self.processor = None
         self.current_mode = "cruncher"  # "cruncher" or "combiner"
+        self.feed_is_placeholder = True
         
         self.init_ui()
         self.setup_fonts()
@@ -1063,17 +985,17 @@ class ComicCruncher(QMainWindow):
         self.update_progress_labels()
         
         # Show GPU status in activity feed
-        if GPU_AVAILABLE:
-            self.add_to_feed("🚀 GPU acceleration enabled (OpenCV)", is_current=False)
+        if OPENCV_AVAILABLE:
+            self.add_to_feed("🚀 OpenCV SIMD-optimized processing enabled", is_current=False)
         else:
-            self.add_to_feed("💻 Using CPU processing (install opencv-python for GPU acceleration)", is_current=False)
+            self.add_to_feed("💻 Using CPU processing (install opencv-python for SIMD optimization)", is_current=False)
         
         self.add_to_feed("Drop files to begin...", is_current=False)
     
     def init_ui(self):
         self.setWindowTitle("Comic Cruncher")
-        self.setFixedSize(1024, 1024)  # Back to original square size
-        self.setStyleSheet(f"background-color: #363d46;")
+        self.setFixedSize(1024, 1024)
+        self.setStyleSheet("background-color: #363d46;")
         
         # Main widget and layout
         main_widget = QWidget()
@@ -1244,9 +1166,7 @@ class ComicCruncher(QMainWindow):
         layout.addLayout(progress_layout)
     
     def setup_fonts(self):
-        """Load Google Fonts"""
-        # For now, using system fonts that are similar
-        # In production, you'd download and load the actual Google Fonts
+        """Configure fonts for the UI"""
         title_font = QFont("Arial Black", 72, QFont.Weight.Bold)
         title_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2)
         self.title_label.setFont(title_font)
@@ -1260,7 +1180,7 @@ class ComicCruncher(QMainWindow):
         self.update_mode_buttons()
         self.update_drag_area_text()
         self.update_progress_labels()
-        self.update_title()  # Add this line
+        self.update_title()
         self.clear_feed()
     
     def update_title(self):
@@ -1338,18 +1258,15 @@ class ComicCruncher(QMainWindow):
     def add_to_feed(self, message, is_current=False):
         """Add a message to the activity feed"""
         if is_current:
-            # Current item in yellow
             color_message = f'<span style="color: #ffd483;">🔄 {message}</span>'
         else:
-            # Completed items in red
             color_message = f'<span style="color: #fc6467;">✓ {message}</span>'
-        
-        current_text = self.activity_feed.toHtml()
-        if "Drop files to begin..." in current_text:
-            # First message, replace placeholder
+
+        if self.feed_is_placeholder and is_current:
+            # First real processing message, replace placeholder
             self.activity_feed.setHtml(color_message)
+            self.feed_is_placeholder = False
         else:
-            # Append new message
             self.activity_feed.append(color_message)
         
         # Auto-scroll to bottom - fixed for PyQt6
@@ -1360,6 +1277,7 @@ class ComicCruncher(QMainWindow):
     def clear_feed(self):
         """Clear the activity feed"""
         self.activity_feed.setText("Drop files to begin...")
+        self.feed_is_placeholder = True
     
     def handle_file_drop(self, file_paths):
         """Handle dropped files (single or multiple)"""
@@ -1405,8 +1323,6 @@ class ComicCruncher(QMainWindow):
     
     def update_progress(self, stage, percentage):
         """Update progress bar for specific stage"""
-        print(f"Progress update: {stage} {percentage}%")  # Debug print
-        
         # Map stage to current mode if needed
         if hasattr(self, 'current_stages'):
             stage_list = list(self.progress_bars.keys())
@@ -1421,7 +1337,6 @@ class ComicCruncher(QMainWindow):
                         bar, label = self.progress_bars[actual_stage]
                         bar.setValue(percentage)
                         label.setText(f"{percentage}%")
-                        print(f"Updated {actual_stage} bar to {percentage}%")  # Debug
                         return
         
         # Fallback: try direct stage match
@@ -1429,7 +1344,6 @@ class ComicCruncher(QMainWindow):
             bar, label = self.progress_bars[stage]
             bar.setValue(percentage)
             label.setText(f"{percentage}%")
-            print(f"Direct update {stage} to {percentage}%")  # Debug
     
     def update_batch_progress(self, current, total):
         """Update batch progress display"""
